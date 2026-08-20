@@ -32,38 +32,59 @@ var Provider = []string{
 
 var lastUpdateTime time.Time
 
+// fetchLLMPrice 使用给定 http.Client 拉取 models.dev 价格数据，返回原始 JSON body。
+func fetchLLMPrice(ctx context.Context, httpClient *http.Client) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, llmPriceUrl, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("failed to fetch LLM info: %s", resp.Status)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
+	}
+	return body, nil
+}
+
 func UpdateLLMPrice(ctx context.Context) error {
 	log.Debugf("update LLM price task started")
 	startTime := time.Now()
 	defer func() {
 		log.Debugf("update LLM price task finished, update time: %s", time.Since(startTime))
 	}()
-	client, err := client.GetHTTPClientSystemProxy(false)
+
+	var body []byte
+	// 优先直连拉取价格（直连对部分网络环境可达且无需代理）
+	httpClient, err := client.GetHTTPClientSystemProxy(false)
+	if err == nil {
+		body, err = fetchLLMPrice(ctx, httpClient)
+	}
+	// 直连失败时回退到系统代理（settings 的 proxy_url），适配受网络限制的环境
 	if err != nil {
-		return err
+		log.Warnf("direct request failed, trying with proxy: %v", err)
+		httpClient, err = client.GetHTTPClientSystemProxy(true)
+		if err != nil {
+			return err
+		}
+		body, err = fetchLLMPrice(ctx, httpClient)
+		if err != nil {
+			return err
+		}
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, llmPriceUrl, nil)
-	if err != nil {
-		return err
-	}
-	req.Header.Set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36")
-	resp, err := client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("failed to fetch LLM info: %s", resp.Status)
-	}
+
 	var rawPrice map[string]struct {
 		Models map[string]struct {
 			ID   string         `json:"id"`
 			Cost model.LLMPrice `json:"cost"`
 		} `json:"models"`
-	}
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return fmt.Errorf("failed to read response body: %w", err)
 	}
 	if err := json.Unmarshal(body, &rawPrice); err != nil {
 		return fmt.Errorf("failed to parse LLM info: %w", err)
