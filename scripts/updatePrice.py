@@ -151,42 +151,51 @@ def main():
     raw_price = fetch_price_data()
     
     entries = []
+    seen_ids = set()
     model_count = 0
-    
+
+    def add_entry(model_id: str, cost: dict) -> bool:
+        """添加一条价格记录，重复的 model_id 只保留首次出现，避免生成重复的 Go map key"""
+        if model_id in seen_ids:
+            return False
+        seen_ids.add(model_id)
+        entries.append(generate_entry(model_id, cost))
+        return True
+
     for provider in PROVIDERS:
         if provider not in raw_price:
             print(f"  Provider '{provider}' not found, skipping...")
             continue
-            
+
         models = raw_price[provider].get("models", {})
         provider_count = 0
-        
+
         for model_data in models.values():
             model_id = model_data.get("id", "").lower()
             cost = model_data.get("cost", {})
-            
+
             if not model_id:
                 continue
-            
+
             # 添加原始模型
-            entries.append(generate_entry(model_id, cost))
-            provider_count += 1
-            
+            if add_entry(model_id, cost):
+                provider_count += 1
+
             # 收集所有别名
             aliases = []
-            
+
             # 1. Claude 模型自动生成别名
             aliases.extend(generate_claude_aliases(model_id))
-            
+
             # 2. 静态别名映射
             if model_id in MODEL_ALIASES:
                 aliases.extend(MODEL_ALIASES[model_id])
-            
-            # 添加别名 (去重)
-            for alias in set(aliases):
-                entries.append(generate_entry(alias.lower(), cost))
-                provider_count += 1
-            
+
+            # 添加别名 (去重，排序保证生成结果稳定)
+            for alias in sorted(set(aliases)):
+                if add_entry(alias.lower(), cost):
+                    provider_count += 1
+
         print(f"  {provider}: {provider_count} models")
         model_count += provider_count
     
