@@ -1,0 +1,108 @@
+name: release
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  release:
+    name: release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@v6
+        with:
+          go-version: 'stable'
+
+      - name: Setup Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 'latest'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'latest'
+          cache: 'pnpm'
+          cache-dependency-path: web/pnpm-lock.yaml
+
+      - name: Build
+        run: bash scripts/build.sh release
+
+      - name: Get latest tag
+        id: tag
+        run: |
+          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
+          echo "TAG_NAME=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "HAS_TAG=$([ -n "$LATEST_TAG" ] && echo true || echo false)" >> $GITHUB_OUTPUT
+
+      - name: Docker meta (Debian)
+        id: meta-debian
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest
+            type=raw,value=${{ steps.tag.outputs.TAG_NAME }},enable=${{ steps.tag.outputs.HAS_TAG == 'true' }}
+
+      - name: Docker meta (Alpine)
+        id: meta-alpine
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}
+          tags: |
+            type=raw,value=latest-alpine
+            type=raw,value=${{ steps.tag.outputs.TAG_NAME }}-alpine,enable=${{ steps.tag.outputs.HAS_TAG == 'true' }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push (Alpine)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./scripts/dockerfiles/Dockerfile.alpine
+          push: true
+          platforms: linux/amd64,linux/i386,linux/arm64,linux/arm/v7
+          tags: ${{ steps.meta-alpine.outputs.tags }}
+          labels: ${{ steps.meta-alpine.outputs.labels }}
+          build-args: |
+            TARGETPLATFORM
+
+      - name: Build and push (Debian)
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: ./scripts/dockerfiles/Dockerfile.debian
+          push: true
+          platforms: linux/amd64,linux/i386,linux/arm64,linux/arm/v7
+          tags: ${{ steps.meta-debian.outputs.tags }}
+          labels: ${{ steps.meta-debian.outputs.labels }}
+          build-args: |
+            TARGETPLATFORM
