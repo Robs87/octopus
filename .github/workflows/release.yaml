@@ -61,18 +61,6 @@ jobs:
             type=raw,value=latest
             type=raw,value=${{ steps.tag.outputs.TAG_NAME }},enable=${{ steps.tag.outputs.HAS_TAG == 'true' }}
 
-      - name: Docker meta (Alpine)
-        id: meta-alpine
-        uses: docker/metadata-action@v5
-        with:
-          images: ghcr.io/${{ github.repository }}
-          tags: |
-            type=raw,value=latest-alpine
-            type=raw,value=${{ steps.tag.outputs.TAG_NAME }}-alpine,enable=${{ steps.tag.outputs.HAS_TAG == 'true' }}
-
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
@@ -83,25 +71,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build and push (Alpine)
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./scripts/dockerfiles/Dockerfile.alpine
-          push: true
-          platforms: linux/amd64,linux/i386,linux/arm64,linux/arm/v7
-          tags: ${{ steps.meta-alpine.outputs.tags }}
-          labels: ${{ steps.meta-alpine.outputs.labels }}
-          build-args: |
-            TARGETPLATFORM
-
       - name: Build and push (Debian)
         uses: docker/build-push-action@v5
         with:
           context: .
           file: ./scripts/dockerfiles/Dockerfile.debian
           push: true
-          platforms: linux/amd64,linux/i386,linux/arm64,linux/arm/v7
+          platforms: linux/amd64
           tags: ${{ steps.meta-debian.outputs.tags }}
           labels: ${{ steps.meta-debian.outputs.labels }}
           build-args: |
