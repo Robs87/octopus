@@ -11,12 +11,13 @@ import (
 )
 
 const (
-	TaskPriceUpdate  = "price_update"
-	TaskStatsSave    = "stats_save"
-	TaskRelayLogSave = "relay_log_save"
-	TaskSyncLLM      = "sync_llm"
-	TaskCleanLLM     = "clean_llm"
-	TaskBaseUrlDelay = "base_url_delay"
+	TaskPriceUpdate    = "price_update"
+	TaskStatsSave      = "stats_save"
+	TaskChannelKeySave = "channel_key_save"
+	TaskRelayLogSave   = "relay_log_save"
+	TaskSyncLLM        = "sync_llm"
+	TaskCleanLLM       = "clean_llm"
+	TaskBaseUrlDelay   = "base_url_delay"
 )
 
 func Init() {
@@ -53,6 +54,14 @@ func Init() {
 	}
 	statsSaveInterval := time.Duration(statsSaveIntervalMinutes) * time.Minute
 	Register(TaskStatsSave, statsSaveInterval, false, op.StatsSaveDBTask)
+	// 运行时 key 状态不能只依赖关机钩子保存；定时落库避免进程异常退出丢失健康状态和费用。
+	Register(TaskChannelKeySave, statsSaveInterval, false, func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+		defer cancel()
+		if err := op.ChannelKeySaveDB(ctx); err != nil {
+			log.Warnf("channel key save db task failed: %v", err)
+		}
+	})
 	// 注册中继日志保存任务
 	Register(TaskRelayLogSave, 10*time.Minute, false, func() {
 		if err := op.RelayLogSaveDBTask(context.Background()); err != nil {

@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net/http"
 	"sort"
 	"time"
 
@@ -133,9 +134,29 @@ func isSuccessStatus(k ChannelKey) bool {
 	return k.StatusCode > 0 && k.StatusCode < 400
 }
 
+// IsCircuitFailureStatus 判断一次 HTTP 结果是否足以影响该 key+model 的熔断状态。
+// 普通请求错误不应因为重复提交而把正常 key 熔断；404 则保留为模型不可用信号，
+// 让当前渠道对该模型进入短暂熔断并转到其他渠道。
+func IsCircuitFailureStatus(statusCode int) bool {
+	switch statusCode {
+	case 0, http.StatusUnauthorized, http.StatusPaymentRequired, http.StatusForbidden,
+		http.StatusNotFound, http.StatusRequestTimeout, http.StatusTooManyRequests:
+		return true
+	default:
+		return statusCode >= http.StatusInternalServerError
+	}
+}
+
+// isKeyFailureStatus 判断失败是否更可能由 key 本身导致。
+// 普通 400/404/422 多数是请求或模型问题，不应让 key 进入全局冷却；
+// 认证、配额、限流、网络和服务端故障才需要暂时避开该 key。
+func isKeyFailureStatus(k ChannelKey) bool {
+	return k.StatusCode != http.StatusNotFound && IsCircuitFailureStatus(k.StatusCode)
+}
+
 // GetChannelKeys 按以下规则返回渠道所有可用 key：
 //  1. 过滤禁用、空 key；剩余额度耗尽（Quota > 0 且 Quota-TotalCost <= 0）的 key 视为不可用；
-//  2. 最近 5 分钟内调用失败（HTTP >= 400 或网络错误 StatusCode==0）的 key 进入冷却，跳过；
+//  2. 最近 5 分钟内 key 相关调用失败（认证/配额/限流/服务端或网络错误）的 key 进入冷却，跳过；
 //  3. 可用 key 中优先返回最近成功过的 key（LastUseTimeStamp 最大且 StatusCode 为成功），
 //     让同一个 key 持续使用，避免多个健康 key 之间轮询；
 //  4. 没有成功记录时按 key ID 升序返回，保证行为稳定。
@@ -147,7 +168,7 @@ func (c *Channel) GetChannelKeys() []ChannelKey {
 	}
 
 	nowSec := time.Now().Unix()
-	const cooldownSec = int64(60) // 故障冷却 1 分钟
+	const cooldownSec = int64(5 * 60) // 故障冷却 5 分钟
 
 	var available []ChannelKey
 	for _, k := range c.Keys {
@@ -158,9 +179,9 @@ func (c *Channel) GetChannelKeys() []ChannelKey {
 		if k.Quota > 0 && k.Quota-k.TotalCost <= 0 {
 			continue
 		}
-		// 故障冷却：最近 5 分钟内调用失败（4xx/5xx 或网络错误 StatusCode==0）
+		// 故障冷却：最近 5 分钟内 key 相关调用失败（认证/配额/限流/服务端或网络错误）
 		if k.LastUseTimeStamp > 0 && nowSec-k.LastUseTimeStamp < cooldownSec {
-			if k.StatusCode >= 400 || k.StatusCode == 0 {
+			if isKeyFailureStatus(k) {
 				continue
 			}
 		}
@@ -185,7 +206,7 @@ func (c *Channel) GetChannelKeys() []ChannelKey {
 
 // GetChannelKey 按以下规则选择渠道 key：
 //  1. 过滤禁用、空 key；剩余额度耗尽（Quota > 0 且 Quota-TotalCost <= 0）的 key 视为不可用；
-//  2. 最近 5 分钟内调用失败（HTTP >= 400 或网络错误 StatusCode==0）的 key 进入冷却，跳过；
+//  2. 最近 5 分钟内 key 相关调用失败（认证/配额/限流/服务端或网络错误）的 key 进入冷却，跳过；
 //  3. 优先选择最近成功过的 key，避免健康 key 之间轮询；
 //  4. 没有成功记录时选择第一个可用 key。
 func (c *Channel) GetChannelKey() ChannelKey {

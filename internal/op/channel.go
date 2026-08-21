@@ -14,6 +14,10 @@ import (
 
 var channelCache = cache.New[int, model.Channel](16)
 var channelKeyCache = cache.New[int, model.ChannelKey](16)
+
+// channelCacheUpdateLock 串行化“读取渠道快照、替换一个 key、写回渠道快照”，
+// 避免同一渠道的并发 key 更新互相覆盖。单个 key 的最新值仍由 channelKeyCache 保存。
+var channelCacheUpdateLock sync.Mutex
 var channelKeyCacheNeedUpdate = make(map[int]struct{})
 var channelKeyCacheNeedUpdateLock sync.Mutex
 
@@ -43,28 +47,77 @@ func ChannelKeyUpdate(key model.ChannelKey) error {
 	if key.ID == 0 || key.ChannelID == 0 {
 		return fmt.Errorf("invalid channel key")
 	}
+
+	channelCacheUpdateLock.Lock()
+	defer channelCacheUpdateLock.Unlock()
+	return channelKeyUpdateLocked(key, nil)
+}
+
+// ChannelKeyRecordUsage 原子记录一次 key 结果，并把 costDelta 累加到当前缓存值。
+// costDelta 必须由调用方按本次请求独立计算，不能从旧的 TotalCost 快照推导，
+// 这样并发请求使用同一个 key 时不会丢掉其中一次费用。
+func ChannelKeyRecordUsage(key model.ChannelKey, costDelta float64) error {
+	if key.ID == 0 || key.ChannelID == 0 {
+		return fmt.Errorf("invalid channel key")
+	}
+	if costDelta < 0 {
+		costDelta = 0
+	}
+
+	channelCacheUpdateLock.Lock()
+	defer channelCacheUpdateLock.Unlock()
+	return channelKeyUpdateLocked(key, &costDelta)
+}
+
+// channelKeyUpdateLocked 更新渠道快照和单 key 快照；调用方必须持有 channelCacheUpdateLock。
+func channelKeyUpdateLocked(key model.ChannelKey, costDelta *float64) error {
+	current, hasCurrent := channelKeyCache.Get(key.ID)
+	if hasCurrent && current.ChannelID == key.ChannelID {
+		// 运行时结果只允许更新健康状态字段，配置字段以最新缓存为准，
+		// 防止一个已经开始的请求把后来修改的 key/额度/启用状态写回去。
+		key.Enabled = current.Enabled
+		key.ChannelKey = current.ChannelKey
+		key.Quota = current.Quota
+		key.Remark = current.Remark
+		if costDelta != nil {
+			key.TotalCost = current.TotalCost + *costDelta
+		} else if key.TotalCost < current.TotalCost {
+			key.TotalCost = current.TotalCost
+		}
+	}
+
 	ch, ok := channelCache.Get(key.ChannelID)
 	if !ok {
 		return fmt.Errorf("channel not found")
 	}
+	found := false
 	if len(ch.Keys) > 0 {
 		keys := make([]model.ChannelKey, len(ch.Keys))
 		copy(keys, ch.Keys)
 		for i := range keys {
 			if keys[i].ID == key.ID {
 				keys[i] = key
+				found = true
 				break
 			}
 		}
 		ch.Keys = keys
 	}
+	if !found {
+		return fmt.Errorf("channel key %d not found in channel %d", key.ID, key.ChannelID)
+	}
 	channelCache.Set(key.ChannelID, ch)
 	channelKeyCache.Set(key.ID, key)
-	channelKeyCacheNeedUpdateLock.Lock()
-	channelKeyCacheNeedUpdate[key.ID] = struct{}{}
-	channelKeyCacheNeedUpdateLock.Unlock()
+	markChannelKeyDirty(key.ID)
 	return nil
 }
+
+func markChannelKeyDirty(keyID int) {
+	channelKeyCacheNeedUpdateLock.Lock()
+	channelKeyCacheNeedUpdate[keyID] = struct{}{}
+	channelKeyCacheNeedUpdateLock.Unlock()
+}
+
 func ChannelBaseUrlUpdate(channelID int, baseUrl []model.BaseUrl) error {
 	ch, ok := channelCache.Get(channelID)
 	if !ok {
@@ -97,12 +150,19 @@ func ChannelKeySaveDB(ctx context.Context) error {
 	}
 
 	dbConn := db.GetDB().WithContext(ctx)
-	for _, id := range keyIDs {
+	for i, id := range keyIDs {
 		k, ok := channelKeyCache.Get(id)
 		if !ok {
 			continue
 		}
 		if err := dbConn.Save(&k).Error; err != nil {
+			// 不能因为本次批量保存失败就丢掉 dirty 标记；把当前失败项
+			// 及其后的快照重新排队，下一次 SaveCache 继续尝试。
+			channelKeyCacheNeedUpdateLock.Lock()
+			for _, pendingID := range keyIDs[i:] {
+				channelKeyCacheNeedUpdate[pendingID] = struct{}{}
+			}
+			channelKeyCacheNeedUpdateLock.Unlock()
 			return err
 		}
 	}
@@ -262,7 +322,10 @@ func ChannelKeySetEnabled(keyID, channelID int, enabled bool, ctx context.Contex
 		return err
 	}
 
-	// 同步内存缓存
+	// 同步内存缓存；与运行时状态回写共用同一把锁，避免 enabled 更新被旧的
+	// whole-channel snapshot 覆盖。
+	channelCacheUpdateLock.Lock()
+	defer channelCacheUpdateLock.Unlock()
 	ch, ok := channelCache.Get(channelID)
 	if !ok {
 		return fmt.Errorf("channel not found")

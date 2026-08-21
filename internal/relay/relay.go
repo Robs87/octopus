@@ -106,10 +106,17 @@ func (r *relayRun) run() {
 
 		// 同一 channel+model 候选内先逐个 key 重试；
 		// 当前候选的所有 key 都失败后，才进入下一个分组候选（故障转移）。
+	attemptsLoop:
 		for _, attempt := range attempts {
 			written, err := attempt.run()
 			if err == nil {
 				r.metrics.Save(ctx, true, nil, r.iter.Attempts())
+				return
+			}
+			// 请求取消不是上游 key 故障：不要继续尝试后续 key，也不要把该 key
+			// 写入失败冷却。run() 会在这里统一保存取消后的审计日志并退出。
+			if ctx.Err() != nil {
+				r.metrics.Save(ctx, false, ctx.Err(), r.iter.Attempts())
 				return
 			}
 			if written {
@@ -117,6 +124,21 @@ func (r *relayRun) run() {
 				return
 			}
 			lastErr = err
+
+			switch attempt.failureDecision() {
+			case attemptNextKey:
+				continue
+			case attemptNextChannel:
+				break attemptsLoop
+			case attemptStopRequest:
+				r.metrics.Save(ctx, false, err, r.iter.Attempts())
+				statusCode := attempt.upstreamStatusCode
+				if statusCode < http.StatusBadRequest || statusCode >= http.StatusInternalServerError {
+					statusCode = http.StatusBadGateway
+				}
+				resp.Error(r.c, statusCode, err.Error())
+				return
+			}
 		}
 	}
 
@@ -144,6 +166,9 @@ func (r *relayRun) prepareAttempts() ([]*relayAttempt, error) {
 	if len(keys) == 0 {
 		r.iter.Skip(channel.ID, 0, channel.Name, "no available key")
 		return nil, nil
+	}
+	if stickyKeyID := r.iter.StickyChannelKeyID(); stickyKeyID > 0 {
+		keys = prioritizeChannelKey(keys, stickyKeyID)
 	}
 
 	// 每次候选都把客户端模型改成本次候选的实际上游模型；重试时会被下一候选覆盖。
@@ -181,25 +206,58 @@ func (r *relayRun) prepareAttempts() ([]*relayAttempt, error) {
 	return attempts, nil
 }
 
+func prioritizeChannelKey(keys []dbmodel.ChannelKey, preferredID int) []dbmodel.ChannelKey {
+	for i, key := range keys {
+		if key.ID != preferredID {
+			continue
+		}
+		if i == 0 {
+			return keys
+		}
+		preferred := keys[i]
+		copy(keys[1:i+1], keys[:i])
+		keys[0] = preferred
+		return keys
+	}
+	return keys
+}
+
 // run 统一管理一次通道尝试的完整生命周期。
 func (ra *relayAttempt) run() (bool, error) {
 	span := ra.iter.StartAttempt(ra.channel.ID, ra.usedKey.ID, ra.channel.Name)
+	// 每个 key attempt 都有独立的 usage；否则前一个失败 attempt 的 usage
+	// 可能被后一个成功 attempt 继承，造成重复计费和日志污染。
+	ra.metrics.Stats = dbmodel.StatsMetrics{}
 
 	// 记录本次尝试实际使用的渠道 key（备注优先），供日志 API Key 列展示；
 	// 多次重试时最后一次覆盖，最终渠道与 finalChannel 结论一致。
 	ra.metrics.UsedKeyName = ra.usedKey.DisplayName()
 
 	upstreamStatusCode, fwdErr := ra.forward()
+	ra.upstreamStatusCode = upstreamStatusCode
+	if fwdErr != nil && ra.c.Request.Context().Err() != nil {
+		// 客户端主动断开/取消时，attempt 只记审计结果，不更新 key 健康状态。
+		span.End(dbmodel.AttemptFailed, fwdErr.Error())
+		return false, fwdErr
+	}
 	if fwdErr == nil && upstreamStatusCode == 0 {
 		upstreamStatusCode = http.StatusOK
+		ra.upstreamStatusCode = upstreamStatusCode
+	}
+	if fwdErr != nil && upstreamStatusCode == 0 && !ra.upstreamNetworkError && !ra.streamFailureRetryable {
+		// 没有 HTTP 状态且也不是网络/流读取故障，例如本地转换或空响应错误；
+		// 不应让 key 进入冷却。
+		span.End(dbmodel.AttemptFailed, fwdErr.Error())
+		return false, fwdErr
 	}
 	ra.usedKey.StatusCode = upstreamStatusCode
 	ra.usedKey.LastUseTimeStamp = time.Now().Unix()
 
 	if fwdErr == nil {
-		ra.usedKey.TotalCost += ra.metrics.Stats.InputCost + ra.metrics.Stats.OutputCost
 		ra.usedKey.LastMessage = "正常"
-		op.ChannelKeyUpdate(ra.usedKey)
+		if err := op.ChannelKeyRecordUsage(ra.usedKey, ra.metrics.Stats.InputCost+ra.metrics.Stats.OutputCost); err != nil {
+			log.Warnf("failed to update channel key %d after success: %v", ra.usedKey.ID, err)
+		}
 
 		span.End(dbmodel.AttemptSuccess, "")
 		op.StatsChannelUpdate(ra.channel.ID, dbmodel.StatsMetrics{
@@ -218,13 +276,17 @@ func (ra *relayAttempt) run() (bool, error) {
 	if len(ra.usedKey.LastMessage) > 500 {
 		ra.usedKey.LastMessage = ra.usedKey.LastMessage[:500]
 	}
-	op.ChannelKeyUpdate(ra.usedKey)
+	if err := op.ChannelKeyUpdate(ra.usedKey); err != nil {
+		log.Warnf("failed to update channel key %d after failure: %v", ra.usedKey.ID, err)
+	}
 	span.End(dbmodel.AttemptFailed, fwdErr.Error())
 	op.StatsChannelUpdate(ra.channel.ID, dbmodel.StatsMetrics{
 		WaitTime:      span.Duration().Milliseconds(),
 		RequestFailed: 1,
 	})
-	balancer.RecordFailure(ra.channel.ID, ra.usedKey.ID, ra.internalRequest.Model)
+	if dbmodel.IsCircuitFailureStatus(upstreamStatusCode) || ra.upstreamNetworkError || ra.streamFailureRetryable {
+		balancer.RecordFailure(ra.channel.ID, ra.usedKey.ID, ra.internalRequest.Model)
+	}
 
 	// 余额不足：自动停用该 key；若渠道所有 key 均已停用，则停用渠道。
 	op.DisableInsufficientKey(ra.channel, ra.usedKey, upstreamStatusCode, ra.upstreamErrBody)
@@ -292,7 +354,8 @@ func (ra *relayAttempt) forward() (int, error) {
 	}
 	if result.Stream {
 		if err := ra.writeStream(ctx, result.EventStream); err != nil {
-			return http.StatusOK, err
+			ra.streamFailureRetryable = !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded)
+			return 0, err
 		}
 		return http.StatusOK, nil
 	}
@@ -421,7 +484,7 @@ func (ra *relayAttempt) writeStream(ctx context.Context, clientStream streams.St
 		case <-ctx.Done():
 			log.Infof("client disconnected, stopping stream")
 			_ = clientStream.Close()
-			return nil
+			return ctx.Err()
 		case <-firstTokenC:
 			log.Warnf("first token timeout (%ds), switching channel", firstTokenTimeoutSec)
 			_ = clientStream.Close()
@@ -507,7 +570,9 @@ func (m *relayPipelineMiddleware) OnOutboundRawError(ctx context.Context, err er
 		// 保存原始错误响应体，供余额不足（insufficient_quota / insufficient balance 等）识别。
 		m.upstreamErrBody = upstreamErr.Body
 		m.attempt.upstreamErrBody = upstreamErr.Body
+		return
 	}
+	m.attempt.upstreamNetworkError = isNetworkFailure(err)
 }
 
 func (m *relayPipelineMiddleware) OnOutboundLlmResponse(ctx context.Context, response *llm.Response) (*llm.Response, error) {

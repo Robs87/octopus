@@ -19,6 +19,7 @@ import (
 	"github.com/dlclark/regexp2"
 	"github.com/gin-gonic/gin"
 	"github.com/looplj/axonhub/llm"
+	llmhttpclient "github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer"
 )
 
@@ -184,7 +185,7 @@ func testGroup(c *gin.Context) {
 			if result.Success {
 				// 测试成功后，从上游获取模型上下文长度，用于与分组设置比对
 				ctxLookup, cancelLookup := context.WithTimeout(c.Request.Context(), 15*time.Second)
-				modelCtxLen := getModelContextLength(ctxLookup, channel, item.ModelName)
+				modelCtxLen := getModelContextLength(ctxLookup, channel, usedKey, item.ModelName)
 				cancelLookup()
 
 				resp.Success(c, testGroupResponse{
@@ -209,7 +210,7 @@ func testGroup(c *gin.Context) {
 
 // getModelContextLength 从上游渠道获取指定模型的上下文长度(tokens)。
 // 仅对 OpenAI 兼容接口有效；其他类型或获取失败时返回 0。
-func getModelContextLength(ctx context.Context, channel *model.Channel, modelName string) int {
+func getModelContextLength(ctx context.Context, channel *model.Channel, usedKey model.ChannelKey, modelName string) int {
 	// 仅处理 OpenAI 兼容格式的渠道
 	switch channel.Type {
 	case llm.APIFormatAnthropicMessage, llm.APIFormatGeminiContents:
@@ -228,10 +229,13 @@ func getModelContextLength(ctx context.Context, channel *model.Channel, modelNam
 	if err != nil {
 		return 0
 	}
-	req.Header.Set("Authorization", "Bearer "+channel.GetChannelKey().ChannelKey)
+	req.Header.Set("Authorization", "Bearer "+usedKey.ChannelKey)
 	// 应用自定义头
 	for _, header := range channel.CustomHeader {
 		if header.HeaderKey != "" {
+			if req.Header.Get(header.HeaderKey) != "" && llmhttpclient.IsSensitiveHeader(header.HeaderKey) {
+				continue
+			}
 			req.Header.Set(header.HeaderKey, header.HeaderValue)
 		}
 	}

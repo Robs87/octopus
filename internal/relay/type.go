@@ -28,4 +28,10 @@ type relayAttempt struct {
 
 	// upstreamErrBody 保存本次尝试上游失败响应的原始响应体，用于余额不足等错误识别。
 	upstreamErrBody []byte
+
+	// 下面几个字段只描述本次 attempt，避免把本地转换错误误判成 key 故障，
+	// 也让 relayRun 能决定是换 key、换渠道还是直接返回。
+	upstreamStatusCode     int
+	upstreamNetworkError   bool
+	streamFailureRetryable bool
 }

@@ -23,6 +23,7 @@ import (
 	"github.com/bestruirui/octopus/internal/utils/log"
 	"github.com/gin-gonic/gin"
 	"github.com/looplj/axonhub/llm"
+	llmhttpclient "github.com/looplj/axonhub/llm/httpclient"
 	"github.com/looplj/axonhub/llm/transformer"
 )
 
@@ -289,6 +290,9 @@ func runChannelTest(ctx context.Context, channel *model.Channel, modelName strin
 // runChannelKeyTest 用指定 key 对渠道发起一次最小聊天请求并写测试日志。
 // 与转发链路同规则：余额不足时自动停用该 key；若渠道所有 key 均已停用，则停用渠道。
 func runChannelKeyTest(ctx context.Context, channel *model.Channel, usedKey model.ChannelKey, modelName string, logType string, requestModelName string) testModelResponse {
+	if err := ctx.Err(); err != nil {
+		return testModelResponse{Success: false, Message: err.Error()}
+	}
 	baseURL := channel.GetBaseUrl()
 	if baseURL == "" {
 		return testModelResponse{Success: false, Message: "channel has no available base url"}
@@ -311,12 +315,18 @@ func runChannelKeyTest(ctx context.Context, channel *model.Channel, usedKey mode
 	upstreamResp, err := client.Do(testReq)
 	latency := time.Since(start).Milliseconds()
 	if err != nil {
+		if ctx.Err() != nil {
+			// 请求取消不是 key 故障；不要把后续 key 写成网络错误或触发熔断。
+			return testModelResponse{Success: false, LatencyMS: latency, Message: ctx.Err().Error()}
+		}
 		// 网络错误也记录到 key 状态，避免渠道详情里该 key 一直显示空白。
 		usedKey.StatusCode = 0
 		usedKey.LastUseTimeStamp = time.Now().Unix()
 		usedKey.LastMessage = "网络错误"
-		updateChannelKeyAfterTest(usedKey)
-		balancer.RecordFailure(channel.ID, usedKey.ID, modelName)
+		updateChannelKeyAfterTest(usedKey, 0)
+		if model.IsCircuitFailureStatus(0) {
+			balancer.RecordFailure(channel.ID, usedKey.ID, modelName)
+		}
 		saveTestLog(channel, usedKey, modelName, start, int(latency), 0, 0, 0, false, err.Error(), requestContent, "", logType, requestModelName)
 		return testModelResponse{Success: false, LatencyMS: latency, Message: err.Error()}
 	}
@@ -345,15 +355,12 @@ func runChannelKeyTest(ctx context.Context, channel *model.Channel, usedKey mode
 	}
 	// 测试成功产生的费用累加到该 key 的 total_cost（与转发链路同口径），
 	// 让卡片/编辑界面的消耗金额与额度扣除逻辑在测试后也能及时反映。
-	if success && cost > 0 {
-		usedKey.TotalCost += cost
-	}
 	// 先回写 key 状态，再执行余额不足停用；
 	// 顺序不能反，否则后面回写会用旧的 enabled=true 覆盖停用结果。
-	updateChannelKeyAfterTest(usedKey)
+	updateChannelKeyAfterTest(usedKey, cost)
 	if success {
 		balancer.RecordSuccess(channel.ID, usedKey.ID, modelName)
-	} else {
+	} else if model.IsCircuitFailureStatus(upstreamResp.StatusCode) {
 		balancer.RecordFailure(channel.ID, usedKey.ID, modelName)
 	}
 	if !success {
@@ -371,8 +378,8 @@ func runChannelKeyTest(ctx context.Context, channel *model.Channel, usedKey mode
 
 // updateChannelKeyAfterTest 将测试后的 key 状态更新到缓存并立即落库，
 // 保证渠道详情页能立刻显示正确的 status_code / 最近使用时间 / 消耗金额。
-func updateChannelKeyAfterTest(key model.ChannelKey) {
-	if err := op.ChannelKeyUpdate(key); err != nil {
+func updateChannelKeyAfterTest(key model.ChannelKey, cost float64) {
+	if err := op.ChannelKeyRecordUsage(key, cost); err != nil {
 		log.Warnf("failed to update channel key after test: %v", err)
 		return
 	}
@@ -551,6 +558,9 @@ func buildModelTestRequest(ctx context.Context, channel *model.Channel, baseURL,
 	}
 	for _, h := range channel.CustomHeader {
 		if h.HeaderKey != "" {
+			if req.Header.Get(h.HeaderKey) != "" && llmhttpclient.IsSensitiveHeader(h.HeaderKey) {
+				continue
+			}
 			req.Header.Set(h.HeaderKey, h.HeaderValue)
 		}
 	}

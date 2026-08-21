@@ -1,6 +1,7 @@
 package model
 
 import (
+	"net/http"
 	"testing"
 	"time"
 )
@@ -94,6 +95,36 @@ func TestGetChannelKey_Cooldown(t *testing.T) {
 	got := c.GetChannelKey()
 	if got.ID != 4 {
 		t.Fatalf("expected key 4 (only healthy), got %d", got.ID)
+	}
+}
+
+func TestGetChannelKey_RequestErrorDoesNotCooldown(t *testing.T) {
+	now := nowSec()
+	for _, statusCode := range []int{http.StatusBadRequest, http.StatusNotFound, http.StatusUnprocessableEntity} {
+		c := &Channel{Keys: []ChannelKey{
+			mkKey(1, true, "request-error", 0, 0, statusCode, now-1),
+		}}
+		got := c.GetChannelKey()
+		if got.ID != 1 {
+			t.Fatalf("status %d: expected request-error key to remain available, got %d", statusCode, got.ID)
+		}
+	}
+}
+
+func TestIsCircuitFailureStatus(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   bool
+	}{
+		{status: http.StatusBadRequest, want: false},
+		{status: http.StatusNotFound, want: true},
+		{status: http.StatusUnauthorized, want: true},
+		{status: http.StatusTooManyRequests, want: true},
+		{status: http.StatusBadGateway, want: true},
+	} {
+		if got := IsCircuitFailureStatus(tc.status); got != tc.want {
+			t.Fatalf("IsCircuitFailureStatus(%d) = %v, want %v", tc.status, got, tc.want)
+		}
 	}
 }
 
