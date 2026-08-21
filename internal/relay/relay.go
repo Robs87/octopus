@@ -68,6 +68,7 @@ func newRelayRun(c *gin.Context, inboundType llm.APIFormat, inAdapter transforme
 
 	return &relayRun{
 		c:               c,
+		inboundType:     inboundType,
 		inAdapter:       inAdapter,
 		internalRequest: internalRequest,
 		metrics: &RelayMetrics{
@@ -136,7 +137,7 @@ func (r *relayRun) run() {
 				if statusCode < http.StatusBadRequest || statusCode >= http.StatusInternalServerError {
 					statusCode = http.StatusBadGateway
 				}
-				resp.Error(r.c, statusCode, err.Error())
+				writeRelayError(r.c, r.inboundType, statusCode, err)
 				return
 			}
 		}
@@ -146,7 +147,7 @@ func (r *relayRun) run() {
 		lastErr = errors.New("all channels failed")
 	}
 	r.metrics.Save(ctx, false, lastErr, r.iter.Attempts())
-	resp.Error(r.c, http.StatusBadGateway, lastErr.Error())
+	writeRelayError(r.c, r.inboundType, http.StatusBadGateway, lastErr)
 }
 
 func (r *relayRun) prepareAttempts() ([]*relayAttempt, error) {
@@ -338,12 +339,14 @@ func (ra *relayAttempt) forward() (int, error) {
 	}
 
 	relayMiddleware := &relayPipelineMiddleware{attempt: ra}
+	retryableOutbound := &sameChannelRetryOutbound{Outbound: ra.outAdapter}
 	result, err := pipeline.NewFactory(httpclient.NewHttpClientWithClient(httpClient)).
 		Pipeline(
 			&parsedRequestInbound{Inbound: ra.inAdapter, request: ra.internalRequest},
-			ra.outAdapter,
+			retryableOutbound,
 			pipeline.WithMiddlewares(stream.EnsureUsage(), relayMiddleware),
 			pipeline.WithEmptyResponseDetection(),
+			pipeline.WithRetry(0, relayMaxSameChannelRetries, relayRetryDelay),
 		).
 		Process(ctx, ra.internalRequest.RawRequest)
 	if err != nil {
